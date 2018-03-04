@@ -12,6 +12,10 @@ env = gym.make('MsPacman-v0')
 y = .95 #gamma
 e = 0.1 #random selection epsilion
 num_episodes = 2000
+RANDOM_THRESHOLD = 1000 #minimum number of frames to choose random actions for
+memory_size = 1000
+train_batch_size = 64
+env_features = 210*160*3
 
 def new_weights(shape):
     return tf.Variable(tf.truncated_normal(shape, stddev=0.1))
@@ -77,29 +81,42 @@ def new_fc_layer(input,          # The previous layer.
 
     return layer
 
-with tf.variable_scope('q_net'):
-    env_obs = tf.placeholder(shape=[None, 210, 160, 3], dtype=tf.float32, name='env_obs')
-    with tf.variable_scope('l1'):
-        layer1 = new_conv_layer(input=env_obs, num_input_channels=3,filter_size=5,num_filters=32,max_pooled=True)
-    with tf.variable_scope('l2'):
-        layer2 = new_conv_layer(input=layer1, num_input_channels=32,filter_size=5,num_filters=32,max_pooled=True)
-    with tf.variable_scope('l3'):
-        layer3 = new_conv_layer(input=layer2, num_input_channels=32,filter_size=5,num_filters=64,max_pooled=True)
-    with tf.variable_scope('fc1'):
-        l_flat, num_features = flatten_layer(layer3)
-        fc_1 = new_fc_layer(l_flat, num_features, 128)
-    with tf.variable_scope('fc2'):
-        fc_2 = new_fc_layer(fc_1, 128, env.action_space.n, False)
-    q_out = tf.nn.softmax(fc_2, name='q_out')
-    predict = tf.argmax(q_out, name='action')
-    q_next = tf.placeholder(shape=[None,env.action_space.n],dtype=tf.float32,name='q_next')
-    loss = tf.reduce_mean(tf.squared_difference(q_next, q_out), name='loss')
-    tf.summary.scalar('loss', loss)
-    optimizer = tf.train.RMSPropOptimizer(0.05).minimize(loss)
+class QNet():
+    def __init__(self, trainable=False):
+        self.env_obs = tf.placeholder(shape=[None, 210, 160, 3], dtype=tf.float32)
+        self.layer1 = new_conv_layer(input=self.env_obs, num_input_channels=3,filter_size=5,num_filters=32,max_pooled=True)
+        self.layer2 = new_conv_layer(input=self.layer1, num_input_channels=32,filter_size=5,num_filters=32,max_pooled=True)
+        self.layer3 = new_conv_layer(input=self.layer2, num_input_channels=32,filter_size=5,num_filters=64,max_pooled=True)
+        self.l_flat, self.num_features = flatten_layer(self.layer3)
+        self.fc_1 = new_fc_layer(self.l_flat, self.num_features, 128)
+        self.fc_2 = new_fc_layer(self.fc_1, 128, env.action_space.n, False)
+        self.q_out = tf.nn.softmax(self.fc_2)
+        self.predict = tf.argmax(self.q_out)
+        if trainable:
+            self.q_next = tf.placeholder(shape=[None, env.action_space.n], dtype=tf.float32)
+            self.loss = tf.reduce_mean(tf.squared_difference(self.q_next, self.q_out))
+            self.train_op = tf.train.RMSPropOptimizer(0.05).minimize(self.loss)
 
+#build a table to store previous game states
+table = np.zeros((memory_size, 210 * 160 * 3 * 2 + 2))
+
+def store_transition(state, action, reward, observation):
+    '''stores a transition for training the model'''
+    if 'table_idx' not in globals():
+        global table_idx
+        table_idx = 0
+    state = np.reshape(state, env_features)
+    observation = np.reshape(observation, env_features)
+    transition = np.hstack((state, [action, reward], observation))
+    index = table_idx % memory_size #overwrite old values
+    table[index, :] = transition
+    table_idx += 1
+
+mainQN = QNet(True)
+targetQN = QNet()
 with tf.Session() as sess:
+    frames = 0
     saver = tf.train.Saver()
-    train_writer = tf.summary.FileWriter('mspacman_summary/',sess.graph)
     sess.run(tf.global_variables_initializer())
     f_reward = 0
     for i in range(num_episodes):
@@ -108,20 +125,38 @@ with tf.Session() as sess:
         done = False
         while not done:
             env.render()
-            action, Q = sess.run([predict, q_out],feed_dict={env_obs:[state]})
-            action = np.argmax(action)
-            if np.random.rand(1) < e:
+            frames += 1
+            if frames < RANDOM_THRESHOLD or np.random.rand(1) < e:
                 action = env.action_space.sample()
+            else:
+                action = sess.run([mainQN.predict],feed_dict={mainQN.env_obs:[state]})
+                action = np.argmax(action)
             #Get new state and reward from environment
             observation,reward,done,_ = env.step(action)
-            Q1 = sess.run(q_out, feed_dict={env_obs: [observation]})
-            q_target = Q
-            q_target[0,action] = reward + y*np.max(Q1)
-            sess.run(optimizer,feed_dict={env_obs:[state],q_next:q_target})
+            store_transition(state, action, reward, observation)
+            if frames >= RANDOM_THRESHOLD and frames % 4 == 0:
+                if table_idx > memory_size:
+                    sample_index = np.random.choice(memory_size, size=train_batch_size)
+                else:
+                    sample_index = np.random.choice(table_idx, size=train_batch_size)
+                batch = table[sample_index, :]
+                _observations = batch[:, :env_features]
+                _observations = np.reshape(_observations, (-1, 210, 160, 3))
+                _observations_next = batch[:, -env_features:]
+                _observations_next = np.reshape(_observations_next, (-1, 210, 160, 3))
+                q_next = sess.run(mainQN.q_out, feed_dict={mainQN.env_obs: _observations_next})
+                q_eval_next = sess.run(targetQN.q_out, feed_dict={targetQN.env_obs: _observations_next})
+                q_eval = sess.run(mainQN.q_out, feed_dict={mainQN.env_obs: _observations})
+                q_target = q_eval.copy()
+                batch_index = np.arange(train_batch_size, dtype=np.int32)
+                eval_act_index = batch[:, env_features].astype(int)
+                _reward = batch[:, env_features + 1]
+                max_action = np.argmax(q_eval_next, axis=1)
+                next_selected = q_next[batch_index, max_action]
+                q_target[batch_index, eval_act_index] = _reward + y * next_selected
+                sess.run(mainQN.train_op, feed_dict={mainQN.env_obs: _observations, mainQN.q_next: q_target})
             state = observation
             f_reward += reward
             if done:
                 saver.save(sess, 'mspacman/model')
-                merged = sess.run(tf.summary.merge_all(), feed_dict={env_obs:[state], q_next:q_target})
-                train_writer.add_summary(merged, i)
                 print('mean_reward: ',f_reward/(i+1))
